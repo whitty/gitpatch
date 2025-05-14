@@ -63,9 +63,15 @@ impl Error for ParseError<'_> {
     }
 }
 
-fn consume_content_line(input: Input<'_>) -> IResult<Input<'_>, &str> {
+fn consume_content_line(input: Input<'_>) -> IResult<Input<'_>, (&str, bool)> {
     let (input, raw) = terminated(not_line_ending, line_ending)(input)?;
-    Ok((input, raw.fragment()))
+
+    let (input, no_newline) = opt(terminated(
+        tag("\\ No newline at end of file"),
+        opt(line_ending),
+    ))(input)?;
+
+    Ok((input, (raw.fragment(), no_newline.is_none())))
 }
 
 pub(crate) fn parse_single_patch(s: &str) -> Result<Patch<'_>, ParseError<'_>> {
@@ -107,20 +113,11 @@ fn patch(input: Input) -> IResult<Input, Patch> {
     }
     let (input, files) = headers(input)?;
     let (input, hunks) = chunks(input)?;
-    let (input, no_newline_indicator) = no_newline_indicator(input)?;
     // Ignore trailing empty lines produced by some diff programs
     let (input, _) = many0(line_ending)(input)?;
 
     let (old, new) = files;
-    Ok((
-        input,
-        Patch {
-            old,
-            new,
-            hunks,
-            end_newline: !no_newline_indicator,
-        },
-    ))
+    Ok((input, Patch { old, new, hunks }))
 }
 
 /// Recognize a "binary files XX and YY differ" line as an empty patch.
@@ -152,7 +149,6 @@ fn binary_files_differ(input: Input) -> IResult<Input, Patch> {
                 meta: None,
             },
             hunks: Vec::new(),
-            end_newline: false,
         },
     ))
 }
@@ -182,7 +178,6 @@ fn file_rename_only(input: Input<'_>) -> IResult<Input<'_>, Patch<'_>> {
                 meta: None,
             },
             hunks: Vec::new(),
-            end_newline: false,
         },
     ))
 }
@@ -272,17 +267,20 @@ fn chunk(input: Input) -> IResult<Input, Hunk> {
             // Detect added lines
             map(
                 preceded(tuple((char('+'), not(tag("++ ")))), consume_content_line),
-                Line::Add,
+                |(line, end_newline)| Line::Add(line, end_newline),
             ),
             // Detect removed lines
             map(
                 preceded(tuple((char('-'), not(tag("-- ")))), consume_content_line),
-                Line::Remove,
+                |(line, end_newline)| Line::Remove(line, end_newline),
             ),
             // Detect context lines
-            map(preceded(char(' '), consume_content_line), Line::Context),
+            map(
+                preceded(char(' '), consume_content_line),
+                |(line, end_newline)| Line::Context(line, end_newline),
+            ),
             // Handle empty lines within the chunk
-            map(tag("\n"), |_| Line::Context("")),
+            map(tag("\n"), |_| Line::Context("", false)),
         )),
         // Stop parsing when we detect the next header or have parsed the expected number of lines
         |_| !is_next_header(input),
@@ -324,17 +322,6 @@ fn u64_digit(input: Input<'_>) -> IResult<Input<'_>, u64> {
     let (input, digits) = digit1(input)?;
     let num = digits.fragment().parse::<u64>().unwrap();
     Ok((input, num))
-}
-
-// Trailing newline indicator
-fn no_newline_indicator(input: Input<'_>) -> IResult<Input<'_>, bool> {
-    map(
-        opt(terminated(
-            tag("\\ No newline at end of file"),
-            opt(line_ending),
-        )),
-        |matched| matched.is_some(),
-    )(input)
 }
 
 fn filename(input: Input) -> IResult<Input, Cow<str>> {
@@ -504,7 +491,7 @@ mod tests {
         // note: the trailing tab after lao is intentional and significant here
         // see https://github.com/uniphil/patch-rs/commit/364897dae8599cdb758c00fdc8dacd1645959070
         let sample2b = "\
---- lao	
+--- lao
 +++ tzu	\n";
         test_parser!(headers(sample2b) -> (
             File {path: "lao".into(), meta: None},
@@ -585,15 +572,15 @@ mod tests {
             new_range: Range { start: 1, count: 6 },
             range_hint: "",
             lines: vec![
-                Line::Remove("The Way that can be told of is not the eternal Way;"),
-                Line::Remove("The name that can be named is not the eternal name."),
-                Line::Context("The Nameless is the origin of Heaven and Earth;"),
-                Line::Remove("The Named is the mother of all things."),
-                Line::Add("The named is the mother of all things."),
-                Line::Add(""),
-                Line::Context("Therefore let there always be non-being,"),
-                Line::Context("  so we may see their subtlety,"),
-                Line::Context("And let there always be being,"),
+                Line::remove("The Way that can be told of is not the eternal Way;"),
+                Line::remove("The name that can be named is not the eternal name."),
+                Line::context("The Nameless is the origin of Heaven and Earth;"),
+                Line::remove("The Named is the mother of all things."),
+                Line::add("The named is the mother of all things."),
+                Line::add(""),
+                Line::context("Therefore let there always be non-being,"),
+                Line::context("  so we may see their subtlety,"),
+                Line::context("And let there always be being,"),
             ],
         };
         test_parser!(chunk(sample) -> expected);
@@ -643,15 +630,15 @@ mod tests {
                     new_range: Range { start: 1, count: 6 },
                     range_hint: "",
                     lines: vec![
-                        Line::Remove("The Way that can be told of is not the eternal Way;"),
-                        Line::Remove("The name that can be named is not the eternal name."),
-                        Line::Context("The Nameless is the origin of Heaven and Earth;"),
-                        Line::Remove("The Named is the mother of all things."),
-                        Line::Add("The named is the mother of all things."),
-                        Line::Add(""),
-                        Line::Context("Therefore let there always be non-being,"),
-                        Line::Context("  so we may see their subtlety,"),
-                        Line::Context("And let there always be being,"),
+                        Line::remove("The Way that can be told of is not the eternal Way;"),
+                        Line::remove("The name that can be named is not the eternal name."),
+                        Line::context("The Nameless is the origin of Heaven and Earth;"),
+                        Line::remove("The Named is the mother of all things."),
+                        Line::add("The named is the mother of all things."),
+                        Line::add(""),
+                        Line::context("Therefore let there always be non-being,"),
+                        Line::context("  so we may see their subtlety,"),
+                        Line::context("And let there always be being,"),
                     ],
                 },
                 Hunk {
@@ -659,16 +646,15 @@ mod tests {
                     new_range: Range { start: 8, count: 6 },
                     range_hint: "",
                     lines: vec![
-                        Line::Context("The two are the same,"),
-                        Line::Context("But after they are produced,"),
-                        Line::Context("  they have different names."),
-                        Line::Add("They both may be called deep and profound."),
-                        Line::Add("Deeper and more profound,"),
-                        Line::Add("The door of all subtleties!"),
+                        Line::context("The two are the same,"),
+                        Line::context("But after they are produced,"),
+                        Line::context("  they have different names."),
+                        Line::add("They both may be called deep and profound."),
+                        Line::add("Deeper and more profound,"),
+                        Line::add("The door of all subtleties!"),
                     ],
                 },
             ],
-            end_newline: true,
         };
 
         test_parser!(patch(sample) -> expected);
